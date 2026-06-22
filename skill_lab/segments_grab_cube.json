@@ -1,0 +1,52 @@
+{
+  "episode_0": [
+    {"start": 0, "end": 260, "skill": "approach_cube"},
+    {"start": 261, "end": 330, "skill": "grasp_cube"},
+    {"start": 331, "end": 480, "skill": "lift_cube"}
+  ],
+  "episode_1": [
+    {"start": 0, "end": 240, "skill": "approach_cube"},
+    {"start": 241, "end": 305, "skill": "grasp_cube"},
+    {"start": 306, "end": 444, "skill": "lift_cube"}
+  ],
+  "episode_2": [
+    {"start": 0, "end": 230, "skill": "approach_cube"},
+    {"start": 231, "end": 290, "skill": "grasp_cube"},
+    {"start": 291, "end": 431, "skill": "lift_cube"}
+  ],
+  "episode_3": [
+    {"start": 0, "end": 270, "skill": "approach_cube"},
+    {"start": 271, "end": 345, "skill": "grasp_cube"},
+    {"start": 346, "end": 499, "skill": "lift_cube"}
+  ],
+  "episode_4": [
+    {"start": 0, "end": 300, "skill": "approach_cube"},
+    {"start": 301, "end": 390, "skill": "grasp_cube"},
+    {"start": 391, "end": 566, "skill": "lift_cube"}
+  ],
+  "episode_5": [
+    {"start": 0, "end": 205, "skill": "approach_cube"},
+    {"start": 206, "end": 260, "skill": "grasp_cube"},
+    {"start": 261, "end": 378, "skill": "lift_cube"}
+  ],
+  "episode_6": [
+    {"start": 0, "end": 220, "skill": "approach_cube"},
+    {"start": 221, "end": 280, "skill": "grasp_cube"},
+    {"start": 281, "end": 406, "skill": "lift_cube"}
+  ],
+  "episode_7": [
+    {"start": 0, "end": 240, "skill": "approach_cube"},
+    {"start": 241, "end": 305, "skill": "grasp_cube"},
+    {"start": 306, "end": 442, "skill": "lift_cube"}
+  ],
+  "episode_8": [
+    {"start": 0, "end": 205, "skill": "approach_cube"},
+    {"start": 206, "end": 260, "skill": "grasp_cube"},
+    {"start": 261, "end": 379, "skill": "lift_cube"}
+  ],
+  "episode_9": [
+    {"start": 0, "end": 255, "skill": "approach_cube"},
+    {"start": 256, "end": 325, "skill": "grasp_cube"},
+    {"start": 326, "end": 478, "skill": "lift_cube"}
+  ]
+}
