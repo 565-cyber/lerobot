@@ -59,8 +59,11 @@ lerobot-record \
 """
 
 import logging
+import math
 import time
 import sys
+
+import torch
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
@@ -129,14 +132,56 @@ from lerobot.utils.utils import (
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 sys.path.append("/home/zjq/lerobot/workplace")
 
-from paper_visual_planner import PaperVisualPlanner
-PLANNER_CKPT_PATH = "/home/zjq/lerobot/workplace/paper_planner_resnet18.pt"
+from binary_detector_model import BinaryDetector
 
-GRAB_CUBE_POLICY_PATH = "/home/zjq/lerobot/outputs/train/act_record_test3/checkpoints/last/pretrained_model"
-GRAB_ROLL_PAPER_POLICY_PATH = "/home/zjq/lerobot/outputs/train/act_record_test5/checkpoints/last/pretrained_model"
+# ── 3 Binary Detectors + FSM config ──
+DETECTOR_CKPTS = {
+    "yellow_on_table": "/home/zjq/lerobot/workplace/paper_detector_yellow_on_table.pt",
+    "blue_on_table": "/home/zjq/lerobot/workplace/paper_detector_blue_on_table.pt",
+    "lid_open": "/home/zjq/lerobot/workplace/paper_detector_lid_open.pt",
+}
+DETECTOR_CAMERA_KEY = "observation.images.up"
+DETECTOR_VOTE_WINDOW = 5
+FSM_TRANSITION_CONFIRM = 5   # consecutive frames needed to confirm a state switch
+FSM_TRANSITION_COOLDOWN = 30  # frames to wait after blending before checking next transition (~1s)
+BLEND_FRAMES = 15  # action blending window (~0.5s at 30fps)
+BLEND_SCHEDULE = "exp"  # "linear" | "exp" — RTC-style prefix weight schedule (exp ≈ RTC EXP mode)
+NEUTRAL_BIAS_STRENGTH = 0.3  # 0.0~1.0, strength of neutral waypoint pull (0=disable)
+# Neutral position dict — auto-filled from dataset stats if None. Override per robot:
+# e.g. {"shoulder_pan": 0.0, "shoulder_lift": 0.0, "elbow_flex": 0.0, ...}
+NEUTRAL_POSITION = None
 
-PLANNER_CAMERA_KEY = "observation.images.up"
-PLANNER_SWITCH_THRESHOLD = 0.8
+
+def get_prefix_weight(t: float, schedule: str = "linear") -> float:
+    """RTC-style prefix weight alpha: 1 → 0 as t goes 0 → 1.
+
+    Corresponds to RTC get_prefix_weights() in modeling_rtc.py:
+      - "linear" → LINEAR schedule (linspace 1→0 over blend window)
+      - "exp"    → EXP schedule   (linspace * expm1, then leading ones / trailing zeros)
+    """
+    if schedule == "exp":
+        return 1.0 - math.expm1(1.0 - t) / (math.e - 1.0)
+    return 1.0 - t  # linear
+
+
+def neutral_bump(t: float, strength: float = 0.3) -> float:
+    """Parabolic bump: 0 at t=0, peaks at t=0.5, 0 at t=1.
+
+    This pulls the blended action toward the neutral position during the middle
+    of the transition, creating a safe "detour" through neutral space.
+    """
+    return strength * 4.0 * t * (1.0 - t)
+
+# FSM state → expert name
+FSM_STATE_TO_EXPERT = {
+    1: "Pick up yellow block and put it in trash can.",
+    2: "Pick up blue block and put it in trash can.",
+    3: "close the trash can",
+}
+
+PICK_UP_YELLOW_BLOCK_POLICY_PATH = "/home/zjq/lerobot/outputs/train/act_record_test10/checkpoints/last/pretrained_model"
+PICK_UP_BLUE_BLOCK_POLICY_PATH = "/home/zjq/lerobot/outputs/train/act_record_test8/checkpoints/last/pretrained_model"
+CLOSE_TRASH_CAN_POLICY_PATH = "/home/zjq/lerobot/outputs/train/act_record_test9/checkpoints/last/pretrained_model"
 
 
 @dataclass
@@ -260,11 +305,13 @@ def record_loop(
         RobotObservation, RobotObservation
     ],  # runs after robot
     dataset: LeRobotDataset | None = None,
+    ds_features: dict | None = None,
     teleop: Teleoperator | list[Teleoperator] | None = None,
     policy: PreTrainedPolicy | None = None,
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None,
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None,
-    planner: PaperVisualPlanner | None = None,
+    detectors: dict[str, BinaryDetector] | None = None,
+    fsm_state: dict | None = None,
     expert_policies: dict[str, PreTrainedPolicy] | None = None,
     expert_preprocessors: dict[str, PolicyProcessorPipeline] | None = None,
     expert_postprocessors: dict[str, PolicyProcessorPipeline] | None = None,
@@ -330,7 +377,18 @@ def record_loop(
 
                 p.reset()
 
-    current_expert = None
+    # ── FSM state (per-episode reset) ──
+    if fsm_state is not None:
+        fsm_state["state"] = 1
+        fsm_state["transition_counter"] = {}
+        fsm_state["transition_cooldown"] = 0
+        fsm_state["blending"] = False
+        fsm_state["blend_step"] = 0
+        fsm_state["old_expert_name"] = None
+        fsm_state.pop("state3_lid_closed_frames", None)
+        fsm_state["_status_frame"] = 0
+        for det in fsm_state.get("detectors", {}).values():
+            det.reset()
 
     timestamp = 0
     start_episode_t = time.perf_counter()
@@ -347,85 +405,261 @@ def record_loop(
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
 
-        if policy is not None or dataset is not None:
-            observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+        _features = dataset.features if dataset is not None else ds_features
+
+        if _features is not None:
+            observation_frame = build_dataset_frame(_features, obs_processed, prefix=OBS_STR)
+        elif policy is not None:
+            observation_frame = obs_processed
+        else:
+            observation_frame = None
 
         # Get action from either policy or teleop
 
         if (
-
-            planner is not None
-
+            detectors is not None
+            and fsm_state is not None
             and expert_policies is not None
-
             and expert_preprocessors is not None
-
             and expert_postprocessors is not None
-
             and expert_tasks is not None
-
         ):
+            if fsm_state.get("blending"):
+                # ── RTC-style Prefix Blend + Neutral Waypoint ──
+                # Stage 1: prefix blend (old → new), alpha 1→0
+                # Stage 2: pull toward neutral position (peak at midpoint)
+                step = fsm_state["blend_step"]
+                t = step / BLEND_FRAMES  # normalized time 0 → 1
 
-            # Sticky router:
-            # 本 episode 内一旦选中 expert，就不再切换。
-            # 下一个 episode 开始时 record_loop 会重新进入，current_expert 会重新变成 None。
-            if current_expert is None:
-                expert_name, confidence = planner(observation_frame)
+                # RTC prefix weight: old policy weight (1 at start, 0 at end)
+                alpha = get_prefix_weight(t, BLEND_SCHEDULE)
 
-                if expert_name not in expert_policies:
-                    raise ValueError(f"Planner returned unknown expert: {expert_name}")
+                # Neutral waypoint bump (0 at ends, max at midpoint)
+                bump = neutral_bump(t, NEUTRAL_BIAS_STRENGTH)
 
-                if confidence < PLANNER_SWITCH_THRESHOLD:
-                    logging.info(
-                        f"Planner confidence too low: pred={expert_name}, "
-                        f"confidence={confidence:.4f}. Skip action."
-                    )
-                    continue
+                old_name = fsm_state["old_expert_name"]
+                new_name = FSM_STATE_TO_EXPERT[fsm_state["state"]]
 
-                current_expert = expert_name
-
-                if hasattr(expert_policies[current_expert], "reset"):
-                    expert_policies[current_expert].reset()
-                if hasattr(expert_preprocessors[current_expert], "reset"):
-                    expert_preprocessors[current_expert].reset()
-                if hasattr(expert_postprocessors[current_expert], "reset"):
-                    expert_postprocessors[current_expert].reset()
-
-                logging.info(
-                    f"Lock expert to {current_expert}, confidence={confidence:.4f}"
+                # Run OLD policy (keeps its internal state, continues trajectory)
+                old_action = predict_action(
+                    observation=observation_frame,
+                    policy=expert_policies[old_name],
+                    device=get_safe_torch_device(expert_policies[old_name].config.device),
+                    preprocessor=expert_preprocessors[old_name],
+                    postprocessor=expert_postprocessors[old_name],
+                    use_amp=expert_policies[old_name].config.use_amp,
+                    task=expert_tasks[old_name],
+                    robot_type=robot.robot_type,
                 )
+                old_act = make_robot_action(old_action, _features)
+
+                # Run NEW policy (started fresh, warms up during blending)
+                new_action = predict_action(
+                    observation=observation_frame,
+                    policy=expert_policies[new_name],
+                    device=get_safe_torch_device(expert_policies[new_name].config.device),
+                    preprocessor=expert_preprocessors[new_name],
+                    postprocessor=expert_postprocessors[new_name],
+                    use_amp=expert_policies[new_name].config.use_amp,
+                    task=expert_tasks[new_name],
+                    robot_type=robot.robot_type,
+                )
+                new_act = make_robot_action(new_action, _features)
+
+                # Stage 1: prefix blend old → new
+                base = {
+                    k: alpha * old_act[k] + (1.0 - alpha) * new_act[k]
+                    for k in old_act
+                }
+
+                # Stage 2: neutral waypoint pull
+                if NEUTRAL_POSITION is not None:
+                    blended = {
+                        k: (1.0 - bump) * base[k] + bump * NEUTRAL_POSITION[k]
+                        for k in base
+                    }
+                else:
+                    blended = base
+
+                fsm_state["blend_step"] = step + 1
+                if fsm_state["blend_step"] >= BLEND_FRAMES:
+                    fsm_state["blending"] = False
+                    fsm_state["blend_step"] = 0
+                    fsm_state["old_expert_name"] = None
+                    for det in detectors.values():
+                        det.reset()
+                    logging.info(
+                        f"Blend complete. Now pure State {fsm_state['state']}: {new_name}"
+                    )
+                    # Start cooldown to prevent immediate re-trigger
+                    fsm_state["transition_cooldown"] = FSM_TRANSITION_COOLDOWN
+
+                act_processed_policy: RobotAction = blended
+
             else:
-                expert_name = current_expert
+                # ── FSM-based multi-expert routing ──
+                # 1. Run all 3 binary detectors (each updates its voting history)
+                d1, c1 = detectors["yellow_on_table"](observation_frame)
+                d2, c2 = detectors["blue_on_table"](observation_frame)
+                d3, c3 = detectors["lid_open"](observation_frame)
 
-            selected_policy = expert_policies[expert_name]
+                # ── Periodic status print (~every 1s at 30fps) ──
+                if "_status_frame" not in fsm_state:
+                    fsm_state["_status_frame"] = 0
+                fsm_state["_status_frame"] += 1
+                if fsm_state["_status_frame"] % 30 == 0:
+                    state_name = FSM_STATE_TO_EXPERT[fsm_state["state"]]
+                    state_paths = {
+                        1: PICK_UP_YELLOW_BLOCK_POLICY_PATH,
+                        2: PICK_UP_BLUE_BLOCK_POLICY_PATH,
+                        3: CLOSE_TRASH_CAN_POLICY_PATH,
+                    }
+                    print(
+                        f"[FSM] 当前任务: {state_name}\n"
+                        f"      调用模型: {state_paths[fsm_state['state']]}\n"
+                        f"      检测结果: yellow={d1}({c1:.2f}) blue={d2}({c2:.2f}) lid={d3}({c3:.2f})",
+                        flush=True,
+                    )
 
-            selected_preprocessor = expert_preprocessors[expert_name]
+                # 2. Evaluate FSM transition (skip during cooldown)
+                current_state = fsm_state["state"]
+                cooldown = fsm_state.get("transition_cooldown", 0)
+                if cooldown > 0:
+                    fsm_state["transition_cooldown"] = cooldown - 1
+                    target = None
+                    # Clear counter during cooldown
+                    fsm_state["transition_counter"] = {}
+                else:
+                    target = None
+                    if current_state == 1 and not d1 and d2:
+                        target = 2
+                    elif current_state == 2 and not d2 and d3:
+                        target = 3
+                    # State 3 is terminal — no auto cycle, stays done
 
-            selected_postprocessor = expert_postprocessors[expert_name]
+                counter = fsm_state["transition_counter"]
+                # Periodic debug: show if transition condition is close
+                if "_status_frame" in fsm_state and fsm_state["_status_frame"] % 60 == 0:
+                    need_yellow_off = not d1
+                    need_blue_on = d2
+                    need_blue_off = not d2
+                    need_lid_on = d3
+                    cd = fsm_state.get("transition_cooldown", 0)
+                    cd_str = f" 冷却:{cd}" if cd > 0 else ""
+                    if current_state == 1:
+                        print(
+                            f"[FSM] 等待切换: 黄块拿走({need_yellow_off}) 且 蓝块在桌({need_blue_on})  "
+                            f"计数器: {counter.get((1,2), 0)}/{FSM_TRANSITION_CONFIRM}{cd_str}",
+                            flush=True,
+                        )
+                    elif current_state == 2:
+                        print(
+                            f"[FSM] 等待切换: 蓝块拿走({need_blue_off}) 且 垃圾桶开({need_lid_on})  "
+                            f"计数器: {counter.get((2,3), 0)}/{FSM_TRANSITION_CONFIRM}{cd_str}",
+                            flush=True,
+                        )
+                    elif current_state == 3:
+                        drained = fsm_state.get("state3_lid_closed_frames", 0)
+                        print(
+                            f"[FSM] State 3 终点状态 | "
+                            f"盖子={'已关' if not d3 else '开'} | "
+                            f"{'排空中:'+str(drained)+'/50' if not d3 and drained < 50 else '已完成' if not d3 else '执行中'}",
+                            flush=True,
+                        )
+                if target is None:
+                    counter.clear()
+                else:
+                    key = (current_state, target)
+                    counter[key] = counter.get(key, 0) + 1
+                    if counter[key] >= FSM_TRANSITION_CONFIRM:
+                        old_state = fsm_state["state"]
+                        old_expert = FSM_STATE_TO_EXPERT[old_state]
+                        fsm_state["state"] = target
+                        counter.clear()
 
-            selected_task = expert_tasks[expert_name]
+                        # ── Start blending: old policy fades out, new policy fades in ──
+                        fsm_state["blending"] = True
+                        fsm_state["blend_step"] = 0
+                        fsm_state["old_expert_name"] = old_expert
+                        fsm_state.pop("state3_lid_closed_frames", None)  # reset drain counter
 
-            action_values = predict_action(
+                        # Reset the new expert's buffers (old expert keeps running)
+                        new_expert = FSM_STATE_TO_EXPERT[target]
+                        if hasattr(expert_policies[new_expert], "reset"):
+                            expert_policies[new_expert].reset()
+                        if hasattr(expert_preprocessors[new_expert], "reset"):
+                            expert_preprocessors[new_expert].reset()
+                        if hasattr(expert_postprocessors[new_expert], "reset"):
+                            expert_postprocessors[new_expert].reset()
 
-                observation=observation_frame,
+                        logging.info(
+                            f"FSM: State {old_state} -> {target}, blending {BLEND_FRAMES} frames "
+                            f"(yellow={'Y' if d1 else 'N'}, blue={'Y' if d2 else 'N'}, lid={'Y' if d3 else 'N'})"
+                        )
 
-                policy=selected_policy,
+                # 3. Select expert for current FSM state
+                # State 3: when lid closes, let the policy finish its motion first
+                STATE3_DRAIN_FRAMES = 50  # ~1.6s to finish closing motion after lid detected closed
 
-                device=get_safe_torch_device(selected_policy.config.device),
+                if fsm_state["state"] == 3 and not d3:
+                    # Lid is closed — start/continue drain counter
+                    if "state3_lid_closed_frames" not in fsm_state:
+                        fsm_state["state3_lid_closed_frames"] = 0
+                    fsm_state["state3_lid_closed_frames"] += 1
 
-                preprocessor=selected_preprocessor,
+                    drained = fsm_state["state3_lid_closed_frames"]
+                    if drained < STATE3_DRAIN_FRAMES:
+                        # Still draining: run the close-lid policy to finish its motion
+                        expert_name = FSM_STATE_TO_EXPERT[3]
+                        selected_policy = expert_policies[expert_name]
+                        selected_preprocessor = expert_preprocessors[expert_name]
+                        selected_postprocessor = expert_postprocessors[expert_name]
+                        selected_task = expert_tasks[expert_name]
+                        action_values = predict_action(
+                            observation=observation_frame,
+                            policy=selected_policy,
+                            device=get_safe_torch_device(selected_policy.config.device),
+                            preprocessor=selected_preprocessor,
+                            postprocessor=selected_postprocessor,
+                            use_amp=selected_policy.config.use_amp,
+                            task=selected_task,
+                            robot_type=robot.robot_type,
+                        )
+                        act_processed_policy: RobotAction = make_robot_action(action_values, _features)
+                        if "_status_frame" in fsm_state and fsm_state["_status_frame"] % 30 == 0:
+                            print(f"[FSM] 盖子已关，排空动作中... ({drained}/{STATE3_DRAIN_FRAMES})", flush=True)
+                    else:
+                        # Drain complete: hold position
+                        state_key = "observation.state"
+                        if state_key in observation_frame:
+                            cur_pos = observation_frame[state_key]
+                            stay_action = torch.from_numpy(cur_pos).float().unsqueeze(0)
+                        else:
+                            stay_action = torch.zeros(1, len(_features["action"]["names"]))
+                        act_processed_policy: RobotAction = make_robot_action(stay_action, _features)
+                        if "_status_frame" in fsm_state and fsm_state["_status_frame"] % 30 == 0:
+                            print("[FSM] 任务完成，保持当前位置", flush=True)
+                else:
+                    # Not in State 3 or lid still open — reset drain counter
+                    fsm_state.pop("state3_lid_closed_frames", None)
+                    expert_name = FSM_STATE_TO_EXPERT[fsm_state["state"]]
+                    selected_policy = expert_policies[expert_name]
+                    selected_preprocessor = expert_preprocessors[expert_name]
+                    selected_postprocessor = expert_postprocessors[expert_name]
+                    selected_task = expert_tasks[expert_name]
 
-                postprocessor=selected_postprocessor,
+                    action_values = predict_action(
+                        observation=observation_frame,
+                        policy=selected_policy,
+                        device=get_safe_torch_device(selected_policy.config.device),
+                        preprocessor=selected_preprocessor,
+                        postprocessor=selected_postprocessor,
+                        use_amp=selected_policy.config.use_amp,
+                        task=selected_task,
+                        robot_type=robot.robot_type,
+                    )
 
-                use_amp=selected_policy.config.use_amp,
-
-                task=selected_task,
-
-                robot_type=robot.robot_type,
-
-            )
-
-            act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
+                    act_processed_policy: RobotAction = make_robot_action(action_values, _features)
 
         elif policy is not None and preprocessor is not None and postprocessor is not None:
 
@@ -449,7 +683,7 @@ def record_loop(
 
             )
 
-            act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
+            act_processed_policy: RobotAction = make_robot_action(action_values, _features)
 
         elif policy is None and isinstance(teleop, Teleoperator):
             act = teleop.get_action()
@@ -570,51 +804,76 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},
             },
         )
-        # Load two expert policies and visual planner
+    # ── Load 3 binary detectors + FSM + expert ACT policies ──
 
-    two_expert_enabled = cfg.policy is not None
+    multi_expert_enabled = cfg.policy is not None
 
-    planner = None
-
+    detectors = None
+    fsm_state = None
     expert_policies = None
-
     expert_preprocessors = None
-
     expert_postprocessors = None
-
     expert_tasks = None
 
-    if two_expert_enabled:
+    if multi_expert_enabled:
 
-        logging.info("Loading two-expert ACT router")
+        logging.info("Loading FSM router: 3 binary detectors + 3 ACT experts")
 
-        cube_cfg = PreTrainedConfig.from_pretrained(GRAB_CUBE_POLICY_PATH)
+        # Load 3 binary detectors
+        device = cfg.policy.device
+        detectors = {}
+        for name, ckpt_path in DETECTOR_CKPTS.items():
+            logging.info(f"  Loading detector: {name}")
+            detectors[name] = BinaryDetector(
+                ckpt_path=ckpt_path,
+                device=device,
+                camera_key=DETECTOR_CAMERA_KEY,
+                vote_window=DETECTOR_VOTE_WINDOW,
+            )
 
-        cube_cfg.pretrained_path = GRAB_CUBE_POLICY_PATH
+        # FSM state dict (shared across episodes, per-episode reset in record_loop)
+        fsm_state = {
+            "state": 1,
+            "transition_counter": {},
+            "detectors": detectors,
+            "blending": False,
+            "blend_step": 0,
+            "old_expert_name": None,
+        }
 
-        roll_cfg = PreTrainedConfig.from_pretrained(GRAB_ROLL_PAPER_POLICY_PATH)
+        pick_up_yellow_cfg = PreTrainedConfig.from_pretrained(PICK_UP_YELLOW_BLOCK_POLICY_PATH)
 
-        roll_cfg.pretrained_path = GRAB_ROLL_PAPER_POLICY_PATH
+        pick_up_yellow_cfg.pretrained_path = PICK_UP_YELLOW_BLOCK_POLICY_PATH
+
+        pick_up_blue_cfg = PreTrainedConfig.from_pretrained(PICK_UP_BLUE_BLOCK_POLICY_PATH)
+
+        pick_up_blue_cfg.pretrained_path = PICK_UP_BLUE_BLOCK_POLICY_PATH
+
+        close_cfg = PreTrainedConfig.from_pretrained(CLOSE_TRASH_CAN_POLICY_PATH)
+
+        close_cfg.pretrained_path = CLOSE_TRASH_CAN_POLICY_PATH
 
         expert_policies = {
 
-            "grab_cube": make_policy(cube_cfg, ds_meta=dataset.meta),
+            "Pick up yellow block and put it in trash can.": make_policy(pick_up_yellow_cfg, ds_meta=dataset.meta),
 
-            "grab_roll_paper": make_policy(roll_cfg, ds_meta=dataset.meta),
+            "Pick up blue block and put it in trash can.": make_policy(pick_up_blue_cfg, ds_meta=dataset.meta),
+
+            "close the trash can": make_policy(close_cfg, ds_meta=dataset.meta),
 
         }
 
-        cube_preprocessor, cube_postprocessor = make_pre_post_processors(
+        pick_up_yellow_preprocessor, pick_up_yellow_postprocessor = make_pre_post_processors(
 
-            policy_cfg=cube_cfg,
+            policy_cfg=pick_up_yellow_cfg,
 
-            pretrained_path=cube_cfg.pretrained_path,
+            pretrained_path=pick_up_yellow_cfg.pretrained_path,
 
             dataset_stats=rename_stats(dataset.meta.stats, cfg.dataset.rename_map),
 
             preprocessor_overrides={
 
-                "device_processor": {"device": cube_cfg.device},
+                "device_processor": {"device": pick_up_yellow_cfg.device},
 
                 "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},
 
@@ -622,17 +881,35 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         )
 
-        roll_preprocessor, roll_postprocessor = make_pre_post_processors(
+        pick_up_blue_preprocessor, pick_up_blue_postprocessor = make_pre_post_processors(
 
-            policy_cfg=roll_cfg,
+            policy_cfg=pick_up_blue_cfg,
 
-            pretrained_path=roll_cfg.pretrained_path,
+            pretrained_path=pick_up_blue_cfg.pretrained_path,
 
             dataset_stats=rename_stats(dataset.meta.stats, cfg.dataset.rename_map),
 
             preprocessor_overrides={
 
-                "device_processor": {"device": roll_cfg.device},
+                "device_processor": {"device": pick_up_blue_cfg.device},
+
+                "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},
+
+            },
+
+        )
+
+        close_preprocessor, close_postprocessor = make_pre_post_processors(
+
+            policy_cfg=close_cfg,
+
+            pretrained_path=close_cfg.pretrained_path,
+
+            dataset_stats=rename_stats(dataset.meta.stats, cfg.dataset.rename_map),
+
+            preprocessor_overrides={
+
+                "device_processor": {"device": close_cfg.device},
 
                 "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},
 
@@ -642,41 +919,55 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         expert_preprocessors = {
 
-            "grab_cube": cube_preprocessor,
+            "Pick up yellow block and put it in trash can.": pick_up_yellow_preprocessor,
 
-            "grab_roll_paper": roll_preprocessor,
+            "Pick up blue block and put it in trash can.": pick_up_blue_preprocessor,
+
+            "close the trash can": close_preprocessor,
 
         }
 
         expert_postprocessors = {
 
-            "grab_cube": cube_postprocessor,
+            "Pick up yellow block and put it in trash can.": pick_up_yellow_postprocessor,
 
-            "grab_roll_paper": roll_postprocessor,
+            "Pick up blue block and put it in trash can.": pick_up_blue_postprocessor,
+
+            "close the trash can": close_postprocessor,
 
         }
 
         expert_tasks = {
 
-            "grab_cube": "Grab the cube",
+            "Pick up yellow block and put it in trash can.": "Pick up yellow block and put it in trash can.",
 
-            "grab_roll_paper": "Grab the roll paper",
+            "Pick up blue block and put it in trash can.": "Pick up blue block and put it in trash can.",
+
+            "close the trash can": "close the trash can",
 
         }
 
-        planner = PaperVisualPlanner(
+        logging.info("FSM router loaded: 3 detectors + 3 ACT experts")
 
-            ckpt_path=PLANNER_CKPT_PATH,
-
-            device=cube_cfg.device,
-
-            camera_key=PLANNER_CAMERA_KEY,
-
-            vote_window=5,
-
-        )
-
-        logging.info("Two-expert ACT router loaded")
+    # ── Auto-compute neutral position from dataset stats (action mean) ──
+    global NEUTRAL_POSITION
+    if NEUTRAL_POSITION is None:
+        try:
+            stats = dataset.meta.stats
+            if "action" in stats and "mean" in stats["action"]:
+                action_mean = stats["action"]["mean"]  # flat array
+                action_names = dataset.features["action"]["names"]
+                NEUTRAL_POSITION = {
+                    name: float(action_mean[i]) for i, name in enumerate(action_names)
+                }
+                logging.info(
+                    f"Neutral position auto-computed from dataset stats: "
+                    f"{ {k: f'{v:.3f}' for k, v in NEUTRAL_POSITION.items()} }"
+                )
+            else:
+                logging.info("No action stats found, neutral waypoint disabled (set NEUTRAL_POSITION manually)")
+        except Exception as e:
+            logging.info(f"Could not compute neutral position ({e}), neutral waypoint disabled")
 
     robot.connect()
     if teleop is not None:
@@ -699,7 +990,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 policy=policy,
                 preprocessor=preprocessor,
                 postprocessor=postprocessor,
-                planner=planner,
+                detectors=detectors,
+                fsm_state=fsm_state,
                 expert_policies=expert_policies,
                 expert_preprocessors=expert_preprocessors,
                 expert_postprocessors=expert_postprocessors,
@@ -724,6 +1016,17 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     robot_action_processor=robot_action_processor,
                     robot_observation_processor=robot_observation_processor,
                     teleop=teleop,
+                    policy=policy,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    detectors=detectors,
+                    fsm_state=fsm_state,
+                    expert_policies=expert_policies,
+                    expert_preprocessors=expert_preprocessors,
+                    expert_postprocessors=expert_postprocessors,
+                    expert_tasks=expert_tasks,
+                    dataset=None,                # don't record during reset
+                    ds_features=dataset.features, # needed for observation key mapping
                     control_time_s=cfg.dataset.reset_time_s,
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,

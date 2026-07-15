@@ -62,7 +62,9 @@ import logging
 import math
 import time
 import sys
+from collections import deque
 
+import numpy as np
 import torch
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -144,32 +146,200 @@ DETECTOR_CAMERA_KEY = "observation.images.up"
 DETECTOR_VOTE_WINDOW = 5
 FSM_TRANSITION_CONFIRM = 5   # consecutive frames needed to confirm a state switch
 FSM_TRANSITION_COOLDOWN = 30  # frames to wait after blending before checking next transition (~1s)
-BLEND_FRAMES = 15  # action blending window (~0.5s at 30fps)
-BLEND_SCHEDULE = "exp"  # "linear" | "exp" — RTC-style prefix weight schedule (exp ≈ RTC EXP mode)
-NEUTRAL_BIAS_STRENGTH = 0.3  # 0.0~1.0, strength of neutral waypoint pull (0=disable)
-# Neutral position dict — auto-filled from dataset stats if None. Override per robot:
-# e.g. {"shoulder_pan": 0.0, "shoulder_lift": 0.0, "elbow_flex": 0.0, ...}
+BLEND_FRAMES = 120  # action transition window in frames (~4.0s at 30fps)
+BLEND_WARMUP_FRAMES = 50  # first N frames: warm up new policy, use old policy's output as target. ACT policies need ~50 frames (1.7s) to build meaningful temporal context after reset.
+BLEND_METHOD = "quintic"  # "linear" | "exp" | "quintic" — transition method
+BLEND_HISTORY_SIZE = 5  # frames of action history kept for velocity/acceleration estimation
+BLEND_MAX_STEP = 0.05  # max joint delta per frame during blend (safety velocity clamp)
+# Legacy constants kept for backward compatibility with "linear"/"exp" modes
+BLEND_SCHEDULE = "exp"
+NEUTRAL_BIAS_STRENGTH = 0.3
 NEUTRAL_POSITION = None
 
 
-def get_prefix_weight(t: float, schedule: str = "linear") -> float:
-    """RTC-style prefix weight alpha: 1 → 0 as t goes 0 → 1.
+# ══════════════════════════════════════════════════════════════════════════════
+# Quintic Polynomial Boundary Matching (五次多项式边界匹配)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# The quintic polynomial p(t) = c₀ + c₁t + c₂t² + c₃t³ + c₄t⁴ + c₅t⁵
+# is the lowest-degree polynomial that can simultaneously satisfy
+# position, velocity, and acceleration boundary conditions at both ends:
+#
+#   p(0)=p0,  p'(0)=v0,  p''(0)=a0      ← match current robot state
+#   p(T)=pT,  p'(T)=vT,  p''(T)=aT      ← arrive at target smoothly
+#
+# This guarantees C² continuity (position, velocity, acceleration all
+# continuous) through the transition — a classical result from industrial
+# robot trajectory planning (Lloyd & Hayward).
 
-    Corresponds to RTC get_prefix_weights() in modeling_rtc.py:
-      - "linear" → LINEAR schedule (linspace 1→0 over blend window)
-      - "exp"    → EXP schedule   (linspace * expm1, then leading ones / trailing zeros)
+
+def solve_quintic_coeffs(p0, v0, a0, pT, vT, aT, T):
+    """Solve the six coefficients of a quintic polynomial given boundary conditions.
+
+    Args:
+        p0, v0, a0: position, velocity, acceleration at t=0 (start state).
+        pT, vT, aT: position, velocity, acceleration at t=T (target state).
+        T: total transition duration in frames.
+
+    Returns:
+        numpy array [c0, c1, c2, c3, c4, c5]
     """
+    c0 = p0
+    c1 = v0
+    c2 = a0 / 2.0
+
+    T2 = T * T
+    T3 = T2 * T
+    T4 = T3 * T
+    T5 = T4 * T
+
+    # Right-hand side: how much the upper coefficients must contribute
+    dp = pT - c0 - c1 * T - c2 * T2
+    dv = vT - c1 - 2.0 * c2 * T
+    da = aT - 2.0 * c2
+
+    # 3×3 linear system for c3, c4, c5:
+    # [  T³     T⁴      T⁵  ] [c3]   [Δp]
+    # [ 3T²    4T³     5T⁴ ] [c4] = [Δv]
+    # [ 6T    12T²    20T³ ] [c5]   [Δa]
+    A = np.array([
+        [T3,    T4,     T5],
+        [3*T2,  4*T3,   5*T4],
+        [6*T,   12*T2,  20*T3],
+    ], dtype=np.float64)
+    b = np.array([dp, dv, da], dtype=np.float64)
+
+    c3, c4, c5 = np.linalg.solve(A, b)
+    return np.array([c0, c1, c2, c3, c4, c5], dtype=np.float64)
+
+
+def eval_quintic(coeffs, t):
+    """Evaluate quintic polynomial p(t) = Σ cᵢ·tⁱ at time t."""
+    c0, c1, c2, c3, c4, c5 = coeffs
+    return c0 + c1*t + c2*t*t + c3*t*t*t + c4*t*t*t*t + c5*t*t*t*t*t
+
+
+def compute_velocity_accel(history, dt=1.0):
+    """Estimate velocity and acceleration from recent action history.
+
+    Uses central finite differences over the last 3 frames in the history buffer.
+    Frame interval dt=1.0 means velocity is in units of [joint_units / frame].
+
+    Args:
+        history: list of action dicts, oldest first, newest last.
+        dt: time step in frames (default 1.0 = 1 frame).
+
+    Returns:
+        (v_dict, a_dict) or (None, None) if less than 3 frames of history.
+    """
+    if len(history) < 3:
+        return None, None
+
+    p_2 = history[-3]  # t-2
+    p_1 = history[-2]  # t-1
+    p_0 = history[-1]  # t (current)
+
+    v_1 = {k: (p_1[k] - p_2[k]) / dt for k in p_0}
+    v_0 = {k: (p_0[k] - p_1[k]) / dt for k in p_0}
+    a_0 = {k: (v_0[k] - v_1[k]) / dt for k in p_0}
+
+    return v_0, a_0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LiPo Stage 3: Causal Savitzky-Golay Jerk Minimization (Jerk 最小化)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# LiPo (2506.05165) uses a QP to minimize jerk with bounded perturbation.
+# We achieve the same effect with a causal Savitzky-Golay filter:
+#   - Fit a cubic polynomial to the last SG_WINDOW blended actions
+#   - Evaluate at the most recent point → smoothed action
+#   - A cubic fit naturally rejects high-frequency jerk (4th+ derivatives)
+#   - No QP solver needed — pure numpy, ~microseconds per joint
+
+SG_ENABLED = True          # enable LiPo-style Stage 3 jerk smoothing
+SG_WINDOW = 7              # frames in smoothing window (~233ms at 30Hz)
+SG_ORDER = 3               # cubic polynomial fit
+
+# Savitzky-Golay coefficients precomputed once on first use
+_sg_coeffs_cache = None
+
+
+def _get_sg_coeffs(window, order):
+    """Compute causal Savitzky-Golay filter coefficients.
+
+    Fits a polynomial of given order to `window` points (0, y0), ..., (window-1, y_{window-1})
+    and evaluates at x = window-1 (the most recent point, causal).
+
+    Coefficients c satisfy: smoothed_y = Σ c[i] * y[i], i = 0..window-1
+    """
+    x = np.arange(window, dtype=np.float64)
+    # Vandermonde matrix: V[i,j] = i^j for j=0..order
+    V = np.vander(x, order + 1, increasing=True)  # (window, order+1)
+    # Normal equations: (V^T V) c_poly = V^T y
+    # Filter coefficients for evaluating at x_eval = window-1:
+    x_eval = np.array([(window - 1) ** j for j in range(order + 1)], dtype=np.float64)
+    # c = V (V^T V)^{-1} x_eval^T
+    VTV = V.T @ V
+    VTV_inv = np.linalg.inv(VTV)
+    coeffs = V @ VTV_inv @ x_eval  # (window,) filter coefficients
+    return coeffs.astype(np.float64)
+
+
+def apply_sg_smooth(history, joint_name, window, order):
+    """Apply causal Savitzky-Golay smoothing to one joint's recent history.
+
+    Args:
+        history: list of action dicts, oldest first, newest last.
+        joint_name: key into each dict.
+        window: number of frames in SG window.
+        order: polynomial order for the fit.
+
+    Returns:
+        Smoothed float value for the joint at the current frame.
+    """
+    global _sg_coeffs_cache
+    if _sg_coeffs_cache is None or _sg_coeffs_cache[0] != window or _sg_coeffs_cache[1] != order:
+        _sg_coeffs_cache = (window, order, _get_sg_coeffs(window, order))
+
+    coeffs = _sg_coeffs_cache[2]
+    n = min(len(history), window)
+
+    # Need at least order+2 points for a meaningful polynomial fit.
+    # Fewer points ⇒ skip smoothing and return the latest raw value.
+    if n < order + 2:
+        return float(history[-1][joint_name])
+
+    values = np.array([float(history[-n + i][joint_name]) for i in range(n)], dtype=np.float64)
+
+    if n == window:
+        # Full window: use precomputed coefficients directly
+        smoothed = np.dot(coeffs, values)
+    else:
+        # Partial window: fit a polynomial of given order to the available n points,
+        # evaluate at the most recent point (causal). Avoids the mathematical bias
+        # of truncating full-window coefficients and renormalizing.
+        x = np.arange(n, dtype=np.float64)
+        V = np.vander(x, order + 1, increasing=True)       # (n, order+1)
+        VTV = V.T @ V
+        VTV_inv = np.linalg.inv(VTV)
+        x_eval = np.array([(n - 1) ** j for j in range(order + 1)], dtype=np.float64)
+        partial_coeffs = V @ VTV_inv @ x_eval               # (n,) filter coefficients
+        smoothed = np.dot(partial_coeffs, values)
+
+    return float(smoothed)
+
+
+# Legacy blending helpers kept for backward compatibility
+def get_prefix_weight(t: float, schedule: str = "linear") -> float:
+    """RTC-style prefix weight alpha: 1 → 0 as t goes 0 → 1."""
     if schedule == "exp":
         return 1.0 - math.expm1(1.0 - t) / (math.e - 1.0)
-    return 1.0 - t  # linear
+    return 1.0 - t
 
 
 def neutral_bump(t: float, strength: float = 0.3) -> float:
-    """Parabolic bump: 0 at t=0, peaks at t=0.5, 0 at t=1.
-
-    This pulls the blended action toward the neutral position during the middle
-    of the transition, creating a safe "detour" through neutral space.
-    """
+    """Parabolic bump: 0 at t=0, peaks at t=0.5, 0 at t=1."""
     return strength * 4.0 * t * (1.0 - t)
 
 # FSM state → expert name
@@ -319,6 +489,7 @@ def record_loop(
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
+    blend_log: list | None = None,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -379,20 +550,32 @@ def record_loop(
 
     # ── FSM state (per-episode reset) ──
     if fsm_state is not None:
-        fsm_state["state"] = 1
-        fsm_state["transition_counter"] = {}
-        fsm_state["transition_cooldown"] = 0
-        fsm_state["blending"] = False
-        fsm_state["blend_step"] = 0
-        fsm_state["old_expert_name"] = None
-        fsm_state.pop("state3_lid_closed_frames", None)
-        fsm_state["_status_frame"] = 0
-        for det in fsm_state.get("detectors", {}).values():
-            det.reset()
+        # If task was already completed and this is a reset loop (dataset=None),
+        # skip FSM reset — just hold position without calling any policy.
+        if fsm_state.get("task_done") and dataset is None:
+            task_done = True
+        else:
+            # Fresh episode recording: clear done flag and do full FSM reset.
+            fsm_state.pop("task_done", None)
+            fsm_state["state"] = 1
+            fsm_state["transition_counter"] = {}
+            fsm_state["transition_cooldown"] = 0
+            fsm_state["blending"] = False
+            fsm_state["blend_step"] = 0
+            fsm_state["old_expert_name"] = None
+            fsm_state.pop("state3_lid_closed_frames", None)
+            fsm_state["_status_frame"] = 0
+            # Quintic blending: action history for velocity/acceleration estimation
+            fsm_state["blend_history"] = deque(maxlen=BLEND_HISTORY_SIZE)
+            fsm_state["blend_polynomial"] = None
+            fsm_state["new_policy_history"] = deque(maxlen=BLEND_HISTORY_SIZE)
+            for det in fsm_state.get("detectors", {}).values():
+                det.reset()
 
     timestamp = 0
     start_episode_t = time.perf_counter()
-    while timestamp < control_time_s:
+    task_done = False           # FSM State 3 drain complete flag
+    while (timestamp < control_time_s) or (fsm_state is not None and not task_done):
         start_loop_t = time.perf_counter()
 
         if events["exit_early"]:
@@ -424,77 +607,190 @@ def record_loop(
             and expert_postprocessors is not None
             and expert_tasks is not None
         ):
-            if fsm_state.get("blending"):
-                # ── RTC-style Prefix Blend + Neutral Waypoint ──
-                # Stage 1: prefix blend (old → new), alpha 1→0
-                # Stage 2: pull toward neutral position (peak at midpoint)
+            if task_done:
+                # Task fully complete — hold current position, no policy calls
+                state_key = "observation.state"
+                if state_key in observation_frame:
+                    cur_pos = observation_frame[state_key]
+                    stay_action = torch.from_numpy(cur_pos).float().unsqueeze(0)
+                else:
+                    stay_action = torch.zeros(1, len(_features["action"]["names"]))
+                act_processed_policy: RobotAction = make_robot_action(stay_action, _features)
+            elif fsm_state.get("blending"):
                 step = fsm_state["blend_step"]
-                t = step / BLEND_FRAMES  # normalized time 0 → 1
-
-                # RTC prefix weight: old policy weight (1 at start, 0 at end)
-                alpha = get_prefix_weight(t, BLEND_SCHEDULE)
-
-                # Neutral waypoint bump (0 at ends, max at midpoint)
-                bump = neutral_bump(t, NEUTRAL_BIAS_STRENGTH)
-
-                old_name = fsm_state["old_expert_name"]
                 new_name = FSM_STATE_TO_EXPERT[fsm_state["state"]]
 
-                # Run OLD policy (keeps its internal state, continues trajectory)
-                old_action = predict_action(
-                    observation=observation_frame,
-                    policy=expert_policies[old_name],
-                    device=get_safe_torch_device(expert_policies[old_name].config.device),
-                    preprocessor=expert_preprocessors[old_name],
-                    postprocessor=expert_postprocessors[old_name],
-                    use_amp=expert_policies[old_name].config.use_amp,
-                    task=expert_tasks[old_name],
-                    robot_type=robot.robot_type,
-                )
-                old_act = make_robot_action(old_action, _features)
+                # ── Quintic Polynomial with Receding Horizon ──
+                # Instead of fixing the endpoint at blend start (which becomes
+                # stale as the new policy warms up), we replan EVERY frame:
+                #   - p_current = last blended action (from history buffer)
+                #   - p_target   = new policy's CURRENT output (fresh each frame)
+                #   - T_remain   = BLEND_FRAMES - step (horizon shrinks)
+                #
+                # This guarantees C² continuity from the current robot state
+                # toward the new policy's LATEST desired position, adapting
+                # as the new policy's output improves during warmup.
 
-                # Run NEW policy (started fresh, warms up during blending)
-                new_action = predict_action(
-                    observation=observation_frame,
-                    policy=expert_policies[new_name],
-                    device=get_safe_torch_device(expert_policies[new_name].config.device),
-                    preprocessor=expert_preprocessors[new_name],
-                    postprocessor=expert_postprocessors[new_name],
-                    use_amp=expert_policies[new_name].config.use_amp,
-                    task=expert_tasks[new_name],
-                    robot_type=robot.robot_type,
-                )
-                new_act = make_robot_action(new_action, _features)
+                if BLEND_METHOD == "quintic":
+                    old_name = fsm_state["old_expert_name"]
 
-                # Stage 1: prefix blend old → new
-                base = {
-                    k: alpha * old_act[k] + (1.0 - alpha) * new_act[k]
-                    for k in old_act
-                }
-
-                # Stage 2: neutral waypoint pull
-                if NEUTRAL_POSITION is not None:
-                    blended = {
-                        k: (1.0 - bump) * base[k] + bump * NEUTRAL_POSITION[k]
-                        for k in base
-                    }
-                else:
-                    blended = base
-
-                fsm_state["blend_step"] = step + 1
-                if fsm_state["blend_step"] >= BLEND_FRAMES:
-                    fsm_state["blending"] = False
-                    fsm_state["blend_step"] = 0
-                    fsm_state["old_expert_name"] = None
-                    for det in detectors.values():
-                        det.reset()
-                    logging.info(
-                        f"Blend complete. Now pure State {fsm_state['state']}: {new_name}"
+                    # 1. Run OLD policy to keep its internal state alive
+                    old_action_raw = predict_action(
+                        observation=observation_frame,
+                        policy=expert_policies[old_name],
+                        device=get_safe_torch_device(expert_policies[old_name].config.device),
+                        preprocessor=expert_preprocessors[old_name],
+                        postprocessor=expert_postprocessors[old_name],
+                        use_amp=expert_policies[old_name].config.use_amp,
+                        task=expert_tasks[old_name],
+                        robot_type=robot.robot_type,
                     )
-                    # Start cooldown to prevent immediate re-trigger
-                    fsm_state["transition_cooldown"] = FSM_TRANSITION_COOLDOWN
+                    old_act = make_robot_action(old_action_raw, _features)
 
-                act_processed_policy: RobotAction = blended
+                    # 2. Run NEW policy to warm it up AND get current target
+                    new_action_raw = predict_action(
+                        observation=observation_frame,
+                        policy=expert_policies[new_name],
+                        device=get_safe_torch_device(expert_policies[new_name].config.device),
+                        preprocessor=expert_preprocessors[new_name],
+                        postprocessor=expert_postprocessors[new_name],
+                        use_amp=expert_policies[new_name].config.use_amp,
+                        task=expert_tasks[new_name],
+                        robot_type=robot.robot_type,
+                    )
+                    new_act = make_robot_action(new_action_raw, _features)
+                    # Track new policy's recent outputs to estimate its natural velocity
+                    fsm_state["new_policy_history"].append(
+                        {k: float(new_act[k]) for k in new_act}
+                    )
+
+                    # ── Warmup: skip quintic, follow old policy directly ──
+                    # New policy needs time to fill its temporal buffers.
+                    # During warmup we bypass quintic, running old policy directly
+                    # while the new policy warms up in the background.
+                    if step < BLEND_WARMUP_FRAMES:
+                        blended = {jn: float(old_act[jn]) for jn in old_act}
+                    else:
+                        # 3. Get actual robot velocity/accel from blend history
+                        history = list(fsm_state["blend_history"])
+                        v_curr, a_curr = compute_velocity_accel(history, dt=1.0)
+
+                        # 4. Get new policy's natural velocity/accel
+                        # The blend should end at new policy's CURRENT state,
+                        # not at rest. This eliminates the "pause" at blend end.
+                        new_hist = list(fsm_state["new_policy_history"])
+                        v_new, a_new = compute_velocity_accel(new_hist, dt=1.0)
+
+                        T_remain = float(BLEND_FRAMES - step)
+
+                        # 5. Quintic per joint: last_blended_pos → new_act over T_remain frames
+                        if T_remain > 1.0:
+                            last_blended = history[-1] if history else {
+                                k: float(old_act[k]) for k in old_act
+                            }
+                            blended = {}
+                            for jn in old_act:
+                                p0 = float(last_blended[jn])
+                                v0 = float(v_curr[jn]) if v_curr else 0.0
+                                a0 = float(a_curr[jn]) if a_curr else 0.0
+                                pT = float(new_act[jn])
+                                # Maintain current velocity through blend (redirect, don't stop).
+                                # Using v_new≈0 (new policy still warming up) causes deceleration.
+                                # Using v_curr keeps the robot moving at its natural pace while
+                                # gradually redirecting toward the new target position.
+                                vT = float(v_curr[jn]) if v_curr else 0.0
+                                aT = float(a_curr[jn]) if a_curr else 0.0
+                                coeffs = solve_quintic_coeffs(p0, v0, a0, pT, vT, aT, T_remain)
+                                raw_val = float(eval_quintic(coeffs, 1.0))
+                                blended[jn] = raw_val
+                        else:
+                            blended = {jn: float(new_act[jn]) for jn in new_act}
+
+                    # 5. Track for velocity/accel estimation next frame
+                    fsm_state["blend_history"].append(dict(blended))
+
+                    # 6. LiPo Stage 3: Causal Savitzky-Golay jerk smoothing
+                    if SG_ENABLED and len(fsm_state["blend_history"]) >= 3:
+                        history = list(fsm_state["blend_history"])
+                        blended = {
+                            jn: apply_sg_smooth(history, jn, SG_WINDOW, SG_ORDER)
+                            for jn in blended
+                        }
+
+                    fsm_state["blend_step"] = step + 1
+                    if fsm_state["blend_step"] >= BLEND_FRAMES:
+                        fsm_state["blending"] = False
+                        fsm_state["blend_step"] = 0
+                        fsm_state["blend_polynomial"] = None
+                        fsm_state["blend_history"].clear()
+                        fsm_state["new_policy_history"].clear()
+                        fsm_state["old_expert_name"] = None
+                        for det in detectors.values():
+                            det.reset()
+                        logging.info(
+                            f"Quintic blend complete. Now State {fsm_state['state']}: {new_name}"
+                        )
+                        fsm_state["transition_cooldown"] = FSM_TRANSITION_COOLDOWN
+
+                    act_processed_policy: RobotAction = blended
+
+                else:
+                    # ── Legacy: Prefix Blend + Neutral Waypoint (linear/exp) ──
+                    t = step / BLEND_FRAMES
+                    alpha = get_prefix_weight(t, BLEND_SCHEDULE)
+                    bump = neutral_bump(t, NEUTRAL_BIAS_STRENGTH)
+
+                    old_name = fsm_state["old_expert_name"]
+                    old_action = predict_action(
+                        observation=observation_frame,
+                        policy=expert_policies[old_name],
+                        device=get_safe_torch_device(expert_policies[old_name].config.device),
+                        preprocessor=expert_preprocessors[old_name],
+                        postprocessor=expert_postprocessors[old_name],
+                        use_amp=expert_policies[old_name].config.use_amp,
+                        task=expert_tasks[old_name],
+                        robot_type=robot.robot_type,
+                    )
+                    old_act = make_robot_action(old_action, _features)
+
+                    new_action = predict_action(
+                        observation=observation_frame,
+                        policy=expert_policies[new_name],
+                        device=get_safe_torch_device(expert_policies[new_name].config.device),
+                        preprocessor=expert_preprocessors[new_name],
+                        postprocessor=expert_postprocessors[new_name],
+                        use_amp=expert_policies[new_name].config.use_amp,
+                        task=expert_tasks[new_name],
+                        robot_type=robot.robot_type,
+                    )
+                    new_act = make_robot_action(new_action, _features)
+
+                    base = {
+                        k: alpha * old_act[k] + (1.0 - alpha) * new_act[k]
+                        for k in old_act
+                    }
+
+                    if NEUTRAL_POSITION is not None:
+                        blended = {
+                            k: (1.0 - bump) * base[k] + bump * NEUTRAL_POSITION[k]
+                            for k in base
+                        }
+                    else:
+                        blended = base
+
+                    fsm_state["blend_step"] = step + 1
+                    if fsm_state["blend_step"] >= BLEND_FRAMES:
+                        fsm_state["blending"] = False
+                        fsm_state["blend_step"] = 0
+                        fsm_state["old_expert_name"] = None
+                        for det in detectors.values():
+                            det.reset()
+                        logging.info(
+                            f"Blend complete. Now pure State {fsm_state['state']}: {new_name}"
+                        )
+                        fsm_state["transition_cooldown"] = FSM_TRANSITION_COOLDOWN
+
+                    act_processed_policy: RobotAction = blended
 
             else:
                 # ── FSM-based multi-expert routing ──
@@ -630,6 +926,8 @@ def record_loop(
                             print(f"[FSM] 盖子已关，排空动作中... ({drained}/{STATE3_DRAIN_FRAMES})", flush=True)
                     else:
                         # Drain complete: hold position
+                        task_done = True
+                        fsm_state["task_done"] = True  # persist across record_loop calls
                         state_key = "observation.state"
                         if state_key in observation_frame:
                             cur_pos = observation_frame[state_key]
@@ -714,6 +1012,12 @@ def record_loop(
             action_values = act_processed_teleop
             robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
 
+        # ── Keep minimal action history for quintic velocity/accel estimation ──
+        # Stores the last BLEND_HISTORY_SIZE actions. No float() conversion here
+        # to avoid GPU→CPU sync on every frame during normal single-task execution.
+        if fsm_state is not None and action_values is not None:
+            fsm_state["blend_history"].append(dict(action_values))
+
         # Send action to robot
         # Action can eventually be clipped using `max_relative_target`,
         # so action actually sent is saved in the dataset. action = postprocessor.process(action)
@@ -728,6 +1032,14 @@ def record_loop(
 
         if display_data:
             log_rerun_data(observation=obs_processed, action=action_values)
+
+        # Log blend status for offline analysis
+        if blend_log is not None and fsm_state is not None:
+            blend_log.append({
+                "blending": int(fsm_state.get("blending", False)),
+                "blend_step": fsm_state.get("blend_step", 0),
+                "state": fsm_state.get("state", 0),
+            })
 
         dt_s = time.perf_counter() - start_loop_t
         busy_wait(1 / fps - dt_s)
@@ -839,6 +1151,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             "blending": False,
             "blend_step": 0,
             "old_expert_name": None,
+            "blend_history": deque(maxlen=BLEND_HISTORY_SIZE),
+            "blend_polynomial": None,
+            "new_policy_history": deque(maxlen=BLEND_HISTORY_SIZE),
         }
 
         pick_up_yellow_cfg = PreTrainedConfig.from_pretrained(PICK_UP_YELLOW_BLOCK_POLICY_PATH)
@@ -979,6 +1294,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         recorded_episodes = 0
         while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
             log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+            blend_log = []  # per-episode blend status log
             record_loop(
                 robot=robot,
                 events=events,
@@ -1000,6 +1316,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 control_time_s=cfg.dataset.episode_time_s,
                 single_task=cfg.dataset.single_task,
                 display_data=cfg.display_data,
+                blend_log=blend_log,
             )
 
             # Execute a few seconds without recording to give time to manually reset the environment
@@ -1040,6 +1357,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 continue
 
             dataset.save_episode()
+            # Save blend log alongside dataset for offline analysis
+            if blend_log:
+                import json
+                blend_path = Path(dataset.root) / "blend_log.json"
+                existing = []
+                if blend_path.exists():
+                    existing = json.loads(blend_path.read_text())
+                existing.append(blend_log)
+                blend_path.write_text(json.dumps(existing))
             recorded_episodes += 1
 
     log_say("Stop recording", cfg.play_sounds, blocking=True)
