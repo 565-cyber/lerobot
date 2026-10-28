@@ -1,0 +1,16 @@
+{
+  "method": "FK(TCP)+H(z=0)+homothety model fitted to carry-phase observations",
+  "C_px": [
+    182.57577172456755,
+    -499.42127299973674
+  ],
+  "D_mm": 727.8115048799235,
+  "offset_base_mm": [
+    -217.84837596464175,
+    215.97938592669638,
+    7.201765429414942
+  ],
+  "rmse_px": 16.737876680706215,
+  "n_obs": 174,
+  "note": "offset \u5438\u6536 FK/\u624b\u773c\u7cfb\u7edf\u504f\u5dee\uff1bD \u4ecd\u53d7 FK \u7edd\u5bf9\u7cbe\u5ea6\u9650\u5236\uff0c\u89c1 D \u626b\u63cf"
+}

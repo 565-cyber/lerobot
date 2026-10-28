@@ -34,6 +34,39 @@ TRAIN_CONFIG_NAME = "train_config.json"
 
 
 @dataclass
+class SagaConfig:
+    """SaGA（显著度引导的背景增强）的开关与超参 —— 本仓库自加，上游 LeRobot 没有。
+
+    实现全部在 `workplace/saga/`（论文与官方代码见
+    `workplace/background_generalization/`）；`src/` 里只有这个配置和训练循环里的
+    一个调用点。放在这里是为了让设置随 `train_config.json` 一起存进 checkpoint ——
+    本项目的溯源要求。
+
+    图像分辨率与缓冲区容量**刻意不在这里**：它们由数据集元信息推出来
+    （见 `scripts/lerobot_train.py` 的 `_build_saga`），
+    免得配置里留一份会和实际数据漂移的副本。
+    """
+
+    # 要增强哪些相机。默认**两个都增强**，与论文一致：Algorithm 1 逐视觉模态跑，
+    # 每个相机各自一份显著度、各自混合。
+    image_keys: list[str] = field(
+        default_factory=lambda: ["observation.images.up", "observation.images.front"]
+    )
+    # OOD 背景池目录。相对路径按仓库根解析。
+    background_path: str = "workplace/background_generalization/backgrounds/solid8"
+    # 缓冲区里存的显著图分辨率（真实图像降采样）。480x640 全分辨率要 6.6 GB/进程，
+    # 2080Ti 放不下；论文本身也写了缓冲区是降分辨率的。
+    buffer_shape: tuple[int, int] = (120, 160)
+    aug_strategy: str = "robosaga"  # 或 "random_overlay"（论文的头号对照）
+    aug_ratio: float = 0.5  # α：每批增强前 50%
+    update_ratio: float = 0.1  # β：每批更新「最久未更新」的 10%
+    saliency_saga_cap: float = 0.8  # λ
+    blend_alpha: float = 0.5  # 只有 random_overlay 用
+    warmup_epochs: float = 10.0  # 论文：前 10 个 epoch 完全不增强
+    disable_buffer: bool = False  # 消融用，不是主臂
+
+
+@dataclass
 class TrainPipelineConfig(HubMixin):
     dataset: DatasetConfig
     env: envs.EnvConfig | None = None
@@ -64,6 +97,9 @@ class TrainPipelineConfig(HubMixin):
     scheduler: LRSchedulerConfig | None = None
     eval: EvalConfig = field(default_factory=EvalConfig)
     wandb: WandBConfig = field(default_factory=WandBConfig)
+    # SaGA 显著度引导的背景增强（见 `SagaConfig`）。默认 None —— 关闭时训练路径
+    # 与上游 LeRobot 完全一致。
+    saga: SagaConfig | None = None
     checkpoint_path: Path | None = field(init=False, default=None)
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)

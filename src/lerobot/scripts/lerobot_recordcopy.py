@@ -286,6 +286,11 @@ def record_loop(
         preprocessor.reset()
         postprocessor.reset()
 
+    # → 的「按两次 = 结束整场」计数必须在每段循环（录制/复位）开始时清零：
+    # 不清零的话，第 1 集按 → 保存后计数停在 1，复位阶段或第 2 集再按一次 → 就被当成
+    # 「第 2 次按下」，整场录制直接停止。
+    events["_right_press_count"] = 0
+
     timestamp = 0
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:

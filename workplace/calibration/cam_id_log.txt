@@ -1,0 +1,15 @@
+
+[结果] 每段的画面空间标准差（std 掉下去 = 镜头被挡）
+  段                        camera_A               camera_B
+                   mean        std       mean        std
+  lead            165.1       44.0      160.2       50.0
+  wrist           157.4       44.7      160.1       50.0
+  overhead        157.3       44.7      160.1       50.0
+  tail            157.2       44.7      160.1       50.0
+
+  挡住【手腕上那个】那一轮：camera_A 的 std 44.0 → 44.7（−-0.7）；camera_B 变动 -0.0
+  ⇒ camera_A（/dev/video0）= 【手腕上那个】的相机
+
+  挡住【俯视工作台那个】那一轮：camera_A 的 std 44.0 → 44.7（−-0.7）；camera_B 变动 -0.0
+  ⇒ camera_A（/dev/video0）= 【俯视工作台那个】的相机
+

@@ -1,0 +1,36 @@
+{
+  "n_tri": 232428,
+  "boundary_edges": 0,
+  "directed_edge_viol": 0,
+  "signed_volume_mm3": 34511.62890625,
+  "winding_ok": 0.9999139518474538,
+  "carve_auto": {
+    "coarse_factor": 4,
+    "coarse_vox_mm": 2.0,
+    "rounds": 1,
+    "grew": false,
+    "coarse_shape": [
+      39,
+      39,
+      39
+    ],
+    "fine_shape": [
+      111,
+      71,
+      95
+    ]
+  },
+  "voxel_volume_mm3": 34896.375,
+  "n_views": 50,
+  "margin_px": 1.0,
+  "voxel_mm": 0.5,
+  "elev_max_deg": null,
+  "gt_name": "sts3215_03a_v1.stl",
+  "gt_tris": 19080,
+  "gt_bbox_mm": [
+    45.4,
+    24.8,
+    39.6
+  ],
+  "clipped_views": 0
+}

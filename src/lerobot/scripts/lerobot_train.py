@@ -14,8 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import sys
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import Any
 
@@ -121,6 +123,53 @@ def update_policy(
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
+
+
+def _build_saga(cfg: TrainPipelineConfig, dataset, unwrapped_policy, dataloader, device):
+    """装配 SaGA 显著度引导增强（`cfg.saga` 为 None 时返回 None，行为与上游一致）。
+
+    **实现代码全在 `workplace/saga/`，这里只做装配。** 这样 `src/` 的改动保持在
+    「一个配置 + 一个调用点」的量级，方法本身可以独立演进与验证。
+    """
+    if cfg.saga is None:
+        return None
+
+    repo_root = Path(__file__).resolve().parents[3]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from workplace.saga import RoboSaGA
+
+    sc = cfg.saga
+    # 分辨率与缓冲区容量从数据集元信息推 —— 配置里不留会和实际数据漂移的副本
+    h, w, _ = dataset.meta.features[sc.image_keys[0]]["shape"]
+    bg_path = Path(sc.background_path)
+    if not bg_path.is_absolute():
+        bg_path = repo_root / bg_path
+    # 论文的 warmup 是「前 10 个 epoch」。步与 epoch 的换算必须用真实的数据加载器
+    # 长度（多卡下是**本进程**的份数），不能拍一个绝对步数。
+    warmup_steps = int(sc.warmup_epochs * len(dataloader))
+
+    saga = RoboSaGA(
+        backbone=unwrapped_policy.model.backbone,
+        image_keys=list(sc.image_keys),
+        image_shape=(h, w),
+        buffer_depth=dataset.meta.total_frames + 1,  # 全局 id 空间 = 帧数（index 从 0 起）
+        background_path=str(bg_path),
+        buffer_shape=tuple(sc.buffer_shape),
+        aug_strategy=sc.aug_strategy,
+        aug_ratio=sc.aug_ratio,
+        update_ratio=sc.update_ratio,
+        saliency_saga_cap=sc.saliency_saga_cap,
+        blend_alpha=sc.blend_alpha,
+        warmup_steps=warmup_steps,
+        disable_buffer=sc.disable_buffer,
+        device=device,
+    )
+    logging.info(
+        f"SaGA 已启用：strategy={sc.aug_strategy} 相机={sc.image_keys} "
+        f"warmup={warmup_steps} 步（{sc.warmup_epochs} epoch × {len(dataloader)} 步/进程）"
+    )
+    return saga
 
 
 @parser.wrap()
@@ -302,6 +351,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     )
     dl_iter = cycle(dataloader)
 
+    # SaGA（可选）。放在 accelerate.prepare **之后**：这里 dataloader 已是本进程的
+    # 分片，`len()` 才是真实每 epoch 步数；policy 也已就位到 device。
+    # 注意 `unwrapped_policy.model.backbone` 与 DDP 包着的是**同一个**模块对象，
+    # 所以这里拿到的 backbone 会跟着训练更新，不是快照。
+    saga = _build_saga(cfg, dataset, accelerator.unwrap_model(policy), dataloader, device)
+
     policy.train()
 
     train_metrics = {
@@ -331,6 +386,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         batch = next(dl_iter)
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
+
+        # SaGA 显著度引导增强（cfg.saga 为 None 时 saga 也是 None，此分支不进）。
+        # 位置有两处讲究：
+        #   1. **必须在 preprocessor 之后** —— 显著度算在归一化后的图上，
+        #      与 OOD 背景的混合也在同一个空间里做（论文一致）。
+        #   2. **必须在 autocast 之外** —— 显著度用 fp32 算，且它自带的
+        #      前向/反传不该被训练时的混合精度策略影响。
+        # 它只改**训练张量**里的相机图像键，数据集落盘内容一个字节都不动。
+        if saga is not None:
+            batch = saga(batch, step)
 
         train_tracker, output_dict = update_policy(
             train_tracker,
